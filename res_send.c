@@ -132,6 +132,9 @@ static const char rcsid[] = "$Id: res_send.c,v 1.1 2006/03/01 19:01:38 majka Exp
 #include "res_debug.h"
 #include "res_private.h"
 #include <sys/fcntl.h>
+#ifdef DARLING
+#include <poll.h>
+#endif
 
 #define EXT(res) ((res)->_u._ext)
 
@@ -883,6 +886,51 @@ get_nsaddr(res_state statp, size_t n)
 	}
 }
 
+#ifdef DARLING
+/*
+ * Seconds to wait on the TCP connect and per reply read: the resolver retrans value, capped.
+ */
+static int
+vc_timeout_secs(res_state statp)
+{
+	int secs = statp->retrans > 0 ? statp->retrans : RES_TIMEOUT;
+	if (secs > RES_MAXRETRANS) secs = RES_MAXRETRANS;
+	return secs;
+}
+
+/*
+ * connect() with a bound: a server that drops the SYN would otherwise block for the kernel's
+ * SYN retry schedule (about two minutes). The bound is SO_SNDTIMEO on a blocking connect:
+ * Darling's connect emulation clears O_NONBLOCK around the Linux connect(), so a non-blocking
+ * connect followed by poll() would never reach the poll. Linux reports an expired send timeout
+ * as EINPROGRESS (EALREADY on a restart after EINTR); both become ETIMEDOUT. The send timeout is
+ * cleared on return. Returns 0, or -1 with errno set.
+ */
+static int
+connect_bounded(int fd, const struct sockaddr *sa, int salen, int secs)
+{
+	struct timeval tv;
+	memset(&tv, 0, sizeof(tv));
+	tv.tv_sec = secs;
+	if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) return -1;
+
+	int rc, err;
+	do
+	{
+		rc = connect(fd, sa, salen);
+		err = errno;
+	} while (rc < 0 && err == EINTR);
+
+	if (rc < 0 && err == EISCONN) rc = 0;
+	if (rc < 0 && (err == EINPROGRESS || err == EALREADY || err == EAGAIN)) err = ETIMEDOUT;
+
+	memset(&tv, 0, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	errno = err;
+	return rc < 0 ? -1 : 0;
+}
+#endif
+
 static int
 send_vc(res_state statp, const u_char *buf, int buflen, u_char *ans, int *anssiz, int *terrno, int ns, struct sockaddr *from, int *fromlen, int notify_token)
 {
@@ -951,7 +999,11 @@ vc_same_ns:
 		}
 
 		errno = 0;
+#ifdef DARLING
+		if (connect_bounded(statp->_vcsock, nsap, nsaplen, vc_timeout_secs(statp)) < 0)
+#else
 		if (connect(statp->_vcsock, nsap, nsaplen) < 0)
+#endif
 		{
 			*terrno = errno;
 			Aerror(statp, stderr, "connect(vc)", errno, nsap, nsaplen);
@@ -962,14 +1014,12 @@ vc_same_ns:
 #ifdef DARLING
 		/*
 		 * Bound the blocking reply read so a stalled server falls through to
-		 * the next one. Per read() call, not per query. No SO_SNDTIMEO: Darling
-		 * passes it to Linux without converting the Darwin timeval.
+		 * the next one. Per read() call, not per query.
 		 */
 		{
 			struct timeval tv;
 			memset(&tv, 0, sizeof(tv));
-			tv.tv_sec = statp->retrans > 0 ? statp->retrans : RES_TIMEOUT;
-			if (tv.tv_sec > RES_MAXRETRANS) tv.tv_sec = RES_MAXRETRANS;
+			tv.tv_sec = vc_timeout_secs(statp);
 			if (setsockopt(statp->_vcsock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
 			{
 				*terrno = errno;
